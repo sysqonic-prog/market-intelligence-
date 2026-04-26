@@ -60,26 +60,61 @@ def is_pre_market():
 def fetch_ohlcv(symbol, period="1y", interval="1d"):
     try:
         import yfinance as yf
-        df = yf.Ticker(symbol).history(period=period, interval=interval)
+        df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True)
         df.index = pd.to_datetime(df.index)
+        if df.empty: return pd.DataFrame()
         return df
-    except:
+    except Exception as e:
         return pd.DataFrame()
+
+def _batch_download(sym_dict, period="5d", interval="1d"):
+    """
+    Download multiple tickers in ONE API call. Returns dict: name → DataFrame.
+    Falls back to individual calls if batch fails.
+    """
+    import yfinance as yf
+    name_list = list(sym_dict.keys())
+    sym_list  = list(sym_dict.values())
+    result    = {n: pd.DataFrame() for n in name_list}
+
+    try:
+        if len(sym_list) == 1:
+            df = yf.Ticker(sym_list[0]).history(period=period, interval=interval, auto_adjust=True)
+            result[name_list[0]] = df
+            return result
+
+        raw = yf.download(
+            sym_list, period=period, interval=interval,
+            group_by="ticker", auto_adjust=True,
+            progress=False, threads=True
+        )
+        for name, sym in sym_dict.items():
+            try:
+                df = raw[sym].dropna(how="all") if sym in raw.columns.get_level_values(0) else pd.DataFrame()
+                result[name] = df
+            except:
+                pass
+    except:
+        # Fallback: individual calls (slower but reliable)
+        for name, sym in sym_dict.items():
+            try:
+                result[name] = yf.Ticker(sym).history(period=period, interval=interval, auto_adjust=True)
+            except:
+                pass
+    return result
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_globals():
     """
-    Fetch global indices. During pre-market/market hours, also fetch
-    US FUTURES (ES=F, NQ=F) which are more relevant than spot indices.
-    GIFT Nifty proxy: NF=F (Nifty Futures) vs previous Nifty close.
+    Fetch global indices + futures in a SINGLE batch API call.
+    GIFT Nifty proxy: NKD=F (Nifty Dollar Futures).
+    US Futures: ES=F (S&P500) and NQ=F (Nasdaq).
     """
-    import yfinance as yf
-
     syms = {
         "S&P 500":     "^GSPC",
-        "S&P Futures": "ES=F",       # ← LIVE US futures (pre-market signal)
+        "S&P Futures": "ES=F",
         "Nasdaq":      "^IXIC",
-        "Nq Futures":  "NQ=F",       # ← LIVE Nasdaq futures
+        "Nq Futures":  "NQ=F",
         "Dow Jones":   "^DJI",
         "Nikkei 225":  "^N225",
         "Hang Seng":   "^HSI",
@@ -87,30 +122,29 @@ def fetch_globals():
         "Gold":        "GC=F",
         "USD/INR":     "USDINR=X",
         "India VIX":   "^INDIAVIX",
-        "GIFT Nifty":  "NKD=F",      # ← Nifty Dollar Futures (GIFT Nifty proxy)
+        "GIFT Nifty":  "NKD=F",
     }
-    out = {}
-    for name, sym in syms.items():
+    out = {n: {"price": 0.0, "chg": 0.0, "prev_close": 0.0} for n in syms}
+    frames = _batch_download(syms, period="5d", interval="1d")
+    for name, df in frames.items():
         try:
-            # Use 5d/1d for overnight change; 1d/5m for intraday live price
-            df_d = yf.Ticker(sym).history(period="5d", interval="1d")
-            df_i = yf.Ticker(sym).history(period="1d", interval="5m")
-            if len(df_d) >= 2:
-                prev_close = float(df_d["Close"].iloc[-2])
-                # Use latest intraday price if available
-                live_price = float(df_i["Close"].iloc[-1]) if not df_i.empty else float(df_d["Close"].iloc[-1])
-                chg = round((live_price - prev_close) / prev_close * 100, 2)
-                out[name] = {"price": round(live_price, 2), "chg": chg, "prev_close": round(prev_close, 2)}
-            elif len(df_d) == 1:
-                out[name] = {"price": round(float(df_d["Close"].iloc[-1]), 2), "chg": 0.0, "prev_close": 0.0}
+            df = df.dropna(how="all")
+            if len(df) >= 2:
+                prev = float(df["Close"].iloc[-2])
+                curr = float(df["Close"].iloc[-1])
+                out[name] = {"price": round(curr, 2),
+                             "chg":   round((curr - prev) / prev * 100, 2),
+                             "prev_close": round(prev, 2)}
+            elif len(df) == 1:
+                curr = float(df["Close"].iloc[-1])
+                out[name] = {"price": round(curr, 2), "chg": 0.0, "prev_close": 0.0}
         except:
-            out[name] = {"price": 0.0, "chg": 0.0, "prev_close": 0.0}
+            pass
     return out
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_sector_indices():
-    """Sector indices for rotation analysis."""
-    import yfinance as yf
+    """Sector indices — single batch download."""
     sectors = {
         "NIFTY IT":     "^CNXIT",
         "NIFTY AUTO":   "^CNXAUTO",
@@ -119,15 +153,16 @@ def fetch_sector_indices():
         "NIFTY FMCG":   "^CNXFMCG",
         "NIFTY REALTY": "^CNXREALTY",
     }
-    out = {}
-    for name, sym in sectors.items():
+    out = {n: {"price": 0.0, "chg": 0.0} for n in sectors}
+    frames = _batch_download(sectors, period="5d", interval="1d")
+    for name, df in frames.items():
         try:
-            df = yf.Ticker(sym).history(period="5d", interval="1d")
+            df = df.dropna(how="all")
             if len(df) >= 2:
-                p, c = float(df["Close"].iloc[-2]), float(df["Close"].iloc[-1])
-                out[name] = {"price": round(c, 2), "chg": round((c-p)/p*100, 2)}
+                p = float(df["Close"].iloc[-2]); c = float(df["Close"].iloc[-1])
+                out[name] = {"price": round(c, 2), "chg": round((c - p) / p * 100, 2)}
         except:
-            out[name] = {"price": 0.0, "chg": 0.0}
+            pass
     return out
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -602,12 +637,16 @@ FNO = {
 
 @st.cache_data(ttl=600, show_spinner=False)
 def scan_stocks(bias_score):
+    import yfinance as yf
     bias = "BULLISH" if bias_score>=2 else "BEARISH" if bias_score<=-2 else "NEUTRAL"
     results=[]
-    for name, sym in FNO.items():
+
+    # Batch download all 20 F&O stocks in ONE API call
+    stock_frames = _batch_download(FNO, period="6mo", interval="1d")
+
+    for name, df in stock_frames.items():
         try:
-            df=fetch_ohlcv(sym,"6mo")
-            df=compute_ta(df)
+            df = df.dropna(how="all")
             if df.empty or len(df)<30: continue
             sig=ta_signals(df); row=df.iloc[-1]; prev=df.iloc[-2]
             ltp=round(float(row["Close"]),2)
@@ -745,10 +784,17 @@ def main():
     st.divider()
 
     # Load data
-    with st.spinner("⏳ Fetching live market data..."):
+    data_errors = []
+    with st.spinner("⏳ Fetching live market data (batch mode)..."):
         ndf   = fetch_ohlcv("^NSEI",    "1y")
         bdf   = fetch_ohlcv("^NSEBANK", "1y")
+        if ndf.empty: data_errors.append("❌ Nifty 50 price data unavailable")
+        if bdf.empty: data_errors.append("❌ Bank Nifty price data unavailable")
+
         gcues = fetch_globals()
+        live_count = sum(1 for v in gcues.values() if v["price"] > 0)
+        if live_count == 0: data_errors.append("❌ Global market data unavailable — Yahoo Finance may be rate-limiting")
+
         sectors = fetch_sector_indices()
         fii_df, fii_source = fetch_fii_dii()
         fii_a  = analyze_fii(fii_df)
@@ -762,6 +808,10 @@ def main():
         ta_n   = ta_signals(ndf_ta)
         ta_b   = ta_signals(bdf_ta)
         gp     = predict_gap(gcues, fii_a, ta_n, oc_n, arts, sectors)
+
+    if data_errors:
+        for err in data_errors:
+            st.markdown(f'<div class="warn-box">{err} — Click 🔄 Refresh Now to retry.</div>', unsafe_allow_html=True)
 
     # Index overview
     n_chg = ((float(ndf["Close"].iloc[-1])-float(ndf["Close"].iloc[-2]))/float(ndf["Close"].iloc[-2])*100) if len(ndf)>=2 else 0
@@ -886,32 +936,4 @@ def main():
         c3.markdown(f"RSI:**{s['rsi']}** Vol:**{s['vr']}x**")
         if not skip:
             tc="#00c853" if "CE" in s["tt"] else "#ff5252" if "PE" in s["tt"] else "#ffeb3b"
-            c4.markdown(f"<span style='color:{tc};font-weight:700'>{s['tt']}</span> Strike ~**{s['strike']}** | 🎯₹{s['tgt']} | 🛑₹{s['sl']} | R1:₹{s['r1']} S1:₹{s['s1']} | ⏱{s['tim']}", unsafe_allow_html=True)
-            c4.caption(f"52W: ₹{s['l52']:,.0f} ↔ ₹{s['h52']:,.0f}")
-        else:
-            c4.markdown("⚪ **No clear setup** — ADX weak or conflicting signals")
-        st.divider()
-
-    # Backtest
-    st.markdown('<div class="section-hdr">🔬 Gap Prediction Backtest (~1 Year, upgraded signals)</div>', unsafe_allow_html=True)
-    bt=run_backtest(ndf_ta)
-    if not bt:
-        st.markdown('<div class="warn-box">⚠️ Backtest needs more data — fetching extended history...</div>', unsafe_allow_html=True)
-        ndf2 = fetch_ohlcv("^NSEI", "2y")
-        ndf2_ta = compute_ta(ndf2.copy()) if not ndf2.empty else ndf2
-        bt = run_backtest(ndf2_ta)
-    if bt:
-        b1,b2,b3,b4,b5,b6=st.columns(6)
-        wr_color="#00c853" if bt["win_rate"]>=58 else "#ffeb3b" if bt["win_rate"]>=48 else "#ff5252"
-        b1.metric("Win Rate",  f"{bt['win_rate']}%")
-        b2.metric("Total P&L", f"₹{bt['total_pnl']:+,}")
-        b3.metric("Avg/Trade", f"₹{bt['avg_pnl']:+,}")
-        b4.metric("Max DD",    f"₹{bt['max_dd']:,}")
-        b5.metric("Trades",    bt["total"])
-        b6.metric("Win/Loss",  f"{bt['mws']}/{bt['mls']}")
-        recent=pd.DataFrame(bt["recent"])
-        recent=recent[["date","gap_pct","pred","actual","correct","pnl"]].rename(columns={
-            "date":"Date","gap_pct":"Gap %","pred":"Predicted","actual":"Actual","correct":"✓","pnl":"Sim P&L ₹"})
-        st.dataframe(recent, use_container_width=True, hide_index=True)
-    else:
-        st.markdo
+            c4.markdown(f"<span 
