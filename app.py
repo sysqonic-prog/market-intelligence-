@@ -286,8 +286,9 @@ def compute_ta(df):
     df["R1"]=2*df["Pivot"]-l; df["S1"]=2*df["Pivot"]-h
     df["R2"]=df["Pivot"]+(h-l); df["S2"]=df["Pivot"]-(h-l)
 
-    # 52-week high/low
-    df["52W_H"]=c.rolling(252).max(); df["52W_L"]=c.rolling(252).min()
+    # 52-week high/low — min_periods=1 so we don't nuke rows when <252 days available
+    df["52W_H"]=c.rolling(252, min_periods=30).max()
+    df["52W_L"]=c.rolling(252, min_periods=30).min()
 
     return df
 
@@ -557,8 +558,7 @@ def predict_gap(gcues, fii_a, ta_n, oc_n, arts, sectors):
         breadth = advancing / total_sec * 100
         if breadth >= 80:   score+=1; factors.append(f"🟢 Sector breadth {breadth:.0f}% advancing → Broad rally")
         elif breadth <= 20: score-=1; factors.append(f"🔴 Sector breadth {breadth:.0f}% advancing → Broad selloff")
-        # Bank sector weight (heavy in Nifty)
-        bank_chg = sectors.get("NIFTY AUTO",{}).get("chg",0)  # proxy if BankNifty already counted
+        else: factors.append(f"⚪ Sector breadth {breadth:.0f}% advancing → Mixed rotation")
 
     # ── 10. News Sentiment ───────────────────────────────────────────────────────
     bull_n = sum(1 for a in arts if "Bullish" in a.get("Sentiment",""))
@@ -664,7 +664,13 @@ def scan_stocks(bias_score):
 # ══════════════════════════════════════════════════════════════════════════════
 def run_backtest(df):
     if df.empty or len(df)<60: return None
-    df=compute_ta(df.copy()).dropna(); results=[]; lookback=min(len(df)-30,252)
+    # Don't recompute TA if already present — just drop rows where critical indicators are NaN
+    critical_cols = ["RSI","MACD_H","ST","ADX","Plus_DI","Minus_DI","EMA21","EMA50","Vol_R"]
+    df = df.copy()
+    if "RSI" not in df.columns:
+        df = compute_ta(df)
+    df = df.dropna(subset=[c for c in critical_cols if c in df.columns])
+    results=[]; lookback=min(len(df)-30, 252)
     for i in range(30,30+lookback-1):
         if i+1>=len(df): break
         row=df.iloc[i]; nxt=df.iloc[i+1]
@@ -889,6 +895,11 @@ def main():
     # Backtest
     st.markdown('<div class="section-hdr">🔬 Gap Prediction Backtest (~1 Year, upgraded signals)</div>', unsafe_allow_html=True)
     bt=run_backtest(ndf_ta)
+    if not bt:
+        st.markdown('<div class="warn-box">⚠️ Backtest needs more data — fetching extended history...</div>', unsafe_allow_html=True)
+        ndf2 = fetch_ohlcv("^NSEI", "2y")
+        ndf2_ta = compute_ta(ndf2.copy()) if not ndf2.empty else ndf2
+        bt = run_backtest(ndf2_ta)
     if bt:
         b1,b2,b3,b4,b5,b6=st.columns(6)
         wr_color="#00c853" if bt["win_rate"]>=58 else "#ffeb3b" if bt["win_rate"]>=48 else "#ff5252"
@@ -902,20 +913,5 @@ def main():
         recent=recent[["date","gap_pct","pred","actual","correct","pnl"]].rename(columns={
             "date":"Date","gap_pct":"Gap %","pred":"Predicted","actual":"Actual","correct":"✓","pnl":"Sim P&L ₹"})
         st.dataframe(recent, use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # News
-    st.markdown('<div class="section-hdr">📰 Market News — Context-Aware Sentiment</div>', unsafe_allow_html=True)
-    if arts:
-        for a in arts[:12]:
-            nc1,nc2=st.columns([5,1])
-            nc1.markdown(f"[**{a['Title']}**]({a['Link']})")
-            nc1.caption(f"{a['Source']} • {a.get('Published','')[:25]}")
-            nc2.markdown(a["Sentiment"])
-            st.divider()
-
-    st.markdown("<center><small style='color:#3a4a5a'>Indian Market Intelligence v2 • ROBO for Boss Chethan • Yahoo Finance + NSE India + RSS • ⚠️ NOT SEBI registered</small></center>", unsafe_allow_html=True)
-
-if __name__=="__main__":
-    main()
+    else:
+        st.markdo
