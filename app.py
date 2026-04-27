@@ -935,5 +935,58 @@ def main():
         c2.markdown(f"₹{s['ltp']:,.2f} {icon}{s['chg']:+.2f}%")
         c3.markdown(f"RSI:**{s['rsi']}** Vol:**{s['vr']}x**")
         if not skip:
-            tc="#00c853" if "CE" in s["tt"] else "#ff5252" if "PE" in s["tt"] else "#ffeb3b"
-            c4.markdown(f"<span 
+            tc = "#00c853" if "CE" in s["tt"] else "#ff5252" if "PE" in s["tt"] else "#ffeb3b"
+            tt = s["tt"]; strike = s["strike"]; tgt = s["tgt"]; sl = s["sl"]
+            r1 = s["r1"]; s1_ = s["s1"]; tim = s["tim"]
+            rec = (
+                f"<span style=\"color:{tc};font-weight:700\">{tt}</span>"
+                f" Strike ~**{strike}** | Target: Rs{tgt} | SL: Rs{sl}"
+                f" | R1: Rs{r1} | S1: Rs{s1_} | Entry: {tim}"
+            )
+            c4.markdown(rec, unsafe_allow_html=True)
+            l52 = s["l52"]; h52 = s["h52"]
+            c4.caption(f"52W: Rs{l52:,.0f} to Rs{h52:,.0f}")
+        else:
+            c4.markdown("⚪ **No clear setup** — ADX weak or conflicting signals")
+        st.divider()
+
+    # Backtest
+    st.markdown('<div class="section-hdr">🔬 Gap Prediction Backtest (~1 Year, upgraded signals)</div>', unsafe_allow_html=True)
+    bt=run_backtest(ndf_ta)
+    if not bt:
+        st.markdown('<div class="warn-box">⚠️ Backtest needs more data — fetching extended history...</div>', unsafe_allow_html=True)
+        ndf2 = fetch_ohlcv("^NSEI", "2y")
+        ndf2_ta = compute_ta(ndf2.copy()) if not ndf2.empty else ndf2
+        bt = run_backtest(ndf2_ta)
+    if bt:
+        b1,b2,b3,b4,b5,b6=st.columns(6)
+        wr_color="#00c853" if bt["win_rate"]>=58 else "#ffeb3b" if bt["win_rate"]>=48 else "#ff5252"
+        b1.metric("Win Rate",  f"{bt['win_rate']}%")
+        b2.metric("Total P&L", f"₹{bt['total_pnl']:+,}")
+        b3.metric("Avg/Trade", f"₹{bt['avg_pnl']:+,}")
+        b4.metric("Max DD",    f"₹{bt['max_dd']:,}")
+        b5.metric("Trades",    bt["total"])
+        b6.metric("Win/Loss",  f"{bt['mws']}/{bt['mls']}")
+        recent=pd.DataFrame(bt["recent"])
+        recent=recent[["date","gap_pct","pred","actual","correct","pnl"]].rename(columns={
+            "date":"Date","gap_pct":"Gap %","pred":"Predicted","actual":"Actual","correct":"✓","pnl":"Sim P&L ₹"})
+        st.dataframe(recent, use_container_width=True, hide_index=True)
+    else:
+        st.markdown('<div class="warn-box">⚠️ Backtest unavailable — insufficient historical data from Yahoo Finance. Try again in a few minutes.</div>', unsafe_allow_html=True)
+
+    st.divider()
+
+    # News
+    st.markdown('<div class="section-hdr">📰 Market News — Context-Aware Sentiment</div>', unsafe_allow_html=True)
+    if arts:
+        for a in arts[:12]:
+            nc1,nc2=st.columns([5,1])
+            nc1.markdown(f"[**{a['Title']}**]({a['Link']})")
+            nc1.caption(f"{a['Source']} • {a.get('Published','')[:25]}")
+            nc2.markdown(a["Sentiment"])
+            st.divider()
+
+    st.markdown("<center><small style='color:#3a4a5a'>Indian Market Intelligence v2 • ROBO for Boss Chethan • Yahoo Finance + NSE India + RSS • ⚠️ NOT SEBI registered</small></center>", unsafe_allow_html=True)
+
+if __name__=="__main__":
+    main()
