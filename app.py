@@ -36,6 +36,15 @@ st.markdown("""
   .warn-box{background:#ff980018;border:1px solid #ff980044;color:#ff9800;padding:8px 12px;border-radius:6px;font-size:12px;margin:4px 0}
   #MainMenu{visibility:hidden}footer{visibility:hidden}header{visibility:hidden}
   .stButton>button{background:#1565c0!important;color:white!important;border:none!important;font-weight:700!important;padding:8px 20px!important;border-radius:8px!important}
+  .ticker-bar{background:#0d1421;border:1px solid #1e2a3a;border-radius:10px;padding:10px 16px;margin-bottom:12px;display:flex;gap:24px;flex-wrap:wrap;align-items:center}
+  .ticker-item{font-size:13px;font-weight:700;white-space:nowrap}
+  .alert-high{background:#ff000018;border-left:4px solid #ff5252;padding:10px 14px;border-radius:6px;margin:4px 0}
+  .alert-med{background:#ff980018;border-left:4px solid #ff9800;padding:10px 14px;border-radius:6px;margin:4px 0}
+  .alert-low{background:#00c85318;border-left:4px solid #00c853;padding:10px 14px;border-radius:6px;margin:4px 0}
+  .alert-title{font-weight:800;font-size:14px}
+  .alert-sub{font-size:12px;color:#90caf9;margin-top:3px}
+  .pulse{animation:pulse 1.5s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -52,6 +61,130 @@ def is_market_open():
 def is_pre_market():
     t = ist_now(); mins = t.hour*60+t.minute
     return t.weekday()<=4 and 480<=mins<555   # 8:00–9:15
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LIVE TICKER — 30s cache (fastest reliable with free Yahoo Finance)
+# True 1-second data needs paid broker API: Zerodha Kite / Upstox / Dhan
+# ══════════════════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_live_ticker():
+    """30-second price snapshot of key indices + futures."""
+    import yfinance as yf
+    syms = {
+        "NIFTY 50":   "^NSEI",
+        "BANK NIFTY": "^NSEBANK",
+        "GIFT Nifty": "NKD=F",
+        "S&P Fut":    "ES=F",
+        "Nq Fut":     "NQ=F",
+        "India VIX":  "^INDIAVIX",
+        "Crude Oil":  "CL=F",
+        "USD/INR":    "USDINR=X",
+    }
+    out = {n: {"price": 0.0, "chg": 0.0} for n in syms}
+    try:
+        sym_list = list(syms.values())
+        raw = yf.download(sym_list, period="2d", interval="5m",
+                          group_by="ticker", auto_adjust=True,
+                          progress=False, threads=True)
+        # Get prev-session close for accurate overnight change
+        daily = yf.download(sym_list, period="3d", interval="1d",
+                            group_by="ticker", auto_adjust=True,
+                            progress=False, threads=True)
+        for name, sym in syms.items():
+            try:
+                df5 = raw[sym].dropna(how="all")
+                dfd = daily[sym].dropna(how="all")
+                if df5.empty: continue
+                curr = float(df5["Close"].iloc[-1])
+                prev = float(dfd["Close"].iloc[-2]) if len(dfd) >= 2 else float(df5["Close"].iloc[0])
+                out[name] = {"price": round(curr, 2), "chg": round((curr-prev)/prev*100, 2)}
+            except:
+                pass
+    except:
+        pass
+    return out
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ALERTS ENGINE — scans stocks every refresh, pushes actionable trade alerts
+# ══════════════════════════════════════════════════════════════════════════════
+def generate_alerts(stock_results, nifty_score):
+    alerts = []
+    ts = ist_now().strftime("%I:%M %p")
+    for s in stock_results:
+        name = s["name"]; ltp = s["ltp"]; rsi = s["rsi"]
+        vr = s["vr"]; adx = s["adx"]
+        r1 = s["r1"]; r2 = s["r2"]; s1 = s["s1"]
+        h52 = s["h52"]; l52 = s["l52"]
+        ss = s["ss"]; tt = s["tt"]
+        strike = s["strike"]; tgt = s["tgt"]; sl = s["sl"]; tim = s["tim"]
+
+        # R2 breakout — strongest signal
+        if ltp > r2 and vr >= 1.8:
+            alerts.append({"urgency":"HIGH","stock":name,
+                "signal":"R2 BREAKOUT — Strong Momentum",
+                "detail":f"Price {ltp} above R2 {r2} | Vol {vr:.1f}x | ADX {adx:.0f}",
+                "action":f"BUY CE | Ride trend | SL below R1 {r1}",
+                "entry":"Aggressive entry — strong trend day","ts":ts})
+
+        # R1 breakout with volume
+        elif ltp > r1 and vr >= 1.5 and adx > 22:
+            alerts.append({"urgency":"HIGH","stock":name,
+                "signal":"R1 BREAKOUT + Volume Surge",
+                "detail":f"Price {ltp} broke R1 {r1} | Vol {vr:.1f}x avg | ADX {adx:.0f}",
+                "action":f"BUY CE Strike ~{int(round(ltp/50)*50)} | Target {round(ltp*1.025,1)} | SL {round(ltp*0.987,1)}",
+                "entry":"Enter NOW or on first 1min pullback","ts":ts})
+
+        # Near 52W high with strong trend
+        elif h52 > 0 and ltp >= h52 * 0.98 and adx > 25 and rsi > 55:
+            alerts.append({"urgency":"HIGH","stock":name,
+                "signal":"Near 52W HIGH — Breakout Imminent",
+                "detail":f"LTP {ltp} | 52W High {h52} | ADX {adx:.0f} | RSI {rsi}",
+                "action":f"BUY CE on break of {h52} | Target {round(h52*1.03,1)} | SL {round(ltp*0.985,1)}",
+                "entry":"Buy on 52W high breakout candle close","ts":ts})
+
+        # S1 breakdown — bearish
+        elif ltp < s1 and vr >= 1.5 and adx > 20 and nifty_score <= 0:
+            alerts.append({"urgency":"HIGH","stock":name,
+                "signal":"S1 BREAKDOWN — Short Setup",
+                "detail":f"Price {ltp} broke S1 {s1} | Vol {vr:.1f}x | ADX {adx:.0f}",
+                "action":f"BUY PE Strike ~{strike} | Target {tgt} | SL above S1 {s1}",
+                "entry":"Enter on next 1min red candle close","ts":ts})
+
+        # High-score CE with volume
+        elif ss >= 6 and vr >= 1.8 and "CE" in tt:
+            alerts.append({"urgency":"MED","stock":name,
+                "signal":"High-Conviction CE Setup",
+                "detail":f"Score {ss} | Vol {vr:.1f}x | ADX {adx:.0f} | RSI {rsi}",
+                "action":f"BUY CE Strike ~{strike} | Target {tgt} | SL {sl}",
+                "entry":tim,"ts":ts})
+
+        # High-score PE with volume
+        elif ss <= -6 and vr >= 1.8 and "PE" in tt:
+            alerts.append({"urgency":"MED","stock":name,
+                "signal":"High-Conviction PE Setup",
+                "detail":f"Score {ss} | Vol {vr:.1f}x | ADX {adx:.0f} | RSI {rsi}",
+                "action":f"BUY PE Strike ~{strike} | Target {tgt} | SL {sl}",
+                "entry":tim,"ts":ts})
+
+        # RSI momentum zone with trend
+        elif 55 <= rsi <= 65 and adx > 25 and vr > 1.2 and ss >= 4:
+            alerts.append({"urgency":"MED","stock":name,
+                "signal":"RSI Momentum Zone + Strong Trend",
+                "detail":f"RSI {rsi} in bull zone | ADX {adx:.0f} | Vol {vr:.1f}x",
+                "action":f"BUY CE Strike ~{strike} | Target {tgt} | SL {sl}",
+                "entry":tim,"ts":ts})
+
+        # Oversold bounce
+        elif rsi < 32 and ltp >= s1 * 0.998 and vr > 1.3 and nifty_score >= 0:
+            alerts.append({"urgency":"MED","stock":name,
+                "signal":"Oversold Bounce — Buy Dip",
+                "detail":f"RSI {rsi} oversold | Holding S1 {s1} | Market bias positive",
+                "action":f"BUY CE ATM Strike ~{strike} | Target {tgt} | SL below S1 {s1}",
+                "entry":"Buy when 5min candle closes above S1","ts":ts})
+
+    priority = {"HIGH":0,"MED":1,"LOW":2}
+    alerts.sort(key=lambda x: priority.get(x["urgency"],2))
+    return alerts
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATA FETCHERS
@@ -754,22 +887,40 @@ def run_backtest(df):
 # MAIN APP
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
-    # Auto-refresh
+    # ── Auto-refresh: 30s market hours, 60s pre-market, 5min closed ──────────
     try:
         from streamlit_autorefresh import st_autorefresh
         if is_market_open():
-            st_autorefresh(interval=900_000, key="mkt_refresh")  # 15 min during market
+            st_autorefresh(interval=30_000, key="mkt_refresh")
         elif is_pre_market():
-            st_autorefresh(interval=300_000, key="pre_refresh")   # 5 min pre-market
+            st_autorefresh(interval=60_000, key="pre_refresh")
+        else:
+            st_autorefresh(interval=300_000, key="closed_refresh")
     except: pass
 
-    # Status bar
-    if is_market_open():
-        st.markdown('<div class="status-live">🟢 <b>MARKET LIVE</b> — Auto-refreshing every 15 minutes. Data current as of latest fetch.</div>', unsafe_allow_html=True)
-    elif is_pre_market():
-        st.markdown('<div class="status-live">🟡 <b>PRE-MARKET</b> — Refreshing every 5 min. GIFT Nifty and US Futures live.</div>', unsafe_allow_html=True)
+    mkt_open = is_market_open(); pre_mkt = is_pre_market()
+    now_str  = ist_now().strftime("%I:%M:%S %p IST")
+
+    # ── Live ticker bar ────────────────────────────────────────────────────────
+    ticker = fetch_live_ticker()
+    live_dot = '<span class="pulse">🟢 LIVE</span>' if mkt_open else ("🟡 PRE-MKT" if pre_mkt else "🔴 CLOSED")
+    ticker_parts = [f'<span style="font-size:11px;color:#64b5f6;font-weight:700;letter-spacing:1px">{live_dot} &nbsp;|&nbsp; {now_str} &nbsp;|&nbsp; 30s refresh</span>']
+    for tname, td in ticker.items():
+        if td["price"] == 0: continue
+        tclr = "#00c853" if td["chg"] >= 0 else "#ff5252"
+        tarr = "&#9650;" if td["chg"] >= 0 else "&#9660;"
+        ticker_parts.append(
+            f'<span class="ticker-item"><span style="color:#90caf9">{tname}</span> <span style="color:{tclr}">{td["price"]:,.2f} {tarr}{abs(td["chg"]):.2f}%</span></span>'
+        )
+    st.markdown('<div class="ticker-bar">' + " ".join(ticker_parts) + '</div>', unsafe_allow_html=True)
+
+    # ── Status bar ────────────────────────────────────────────────────────────
+    if mkt_open:
+        st.markdown('<div class="status-live">🟢 <b>MARKET LIVE</b> — Prices + alerts refresh every 30 seconds automatically.</div>', unsafe_allow_html=True)
+    elif pre_mkt:
+        st.markdown('<div class="status-live">🟡 <b>PRE-MARKET</b> — Refreshing every 60 sec. GIFT Nifty + US Futures live.</div>', unsafe_allow_html=True)
     else:
-        st.markdown(f'<div class="status-closed">🔴 <b>MARKET CLOSED</b> — Showing last data. Next session: Mon–Fri 9:15 AM IST</div>', unsafe_allow_html=True)
+        st.markdown('<div class="status-closed">🔴 <b>MARKET CLOSED</b> — Last session data shown. Alerts resume at 9:15 AM IST Mon-Fri</div>', unsafe_allow_html=True)
 
     # Header
     col_t, col_btn = st.columns([5,1])
@@ -949,6 +1100,31 @@ def main():
         else:
             c4.markdown("⚪ **No clear setup** — ADX weak or conflicting signals")
         st.divider()
+
+    # ── Live Alerts ───────────────────────────────────────────────────────────
+    st.markdown('<div class="section-hdr">🚨 Live Trade Alerts — Scanned Every 30 Seconds</div>', unsafe_allow_html=True)
+    alerts = generate_alerts(picks, gp["raw_score"])
+    if not alerts:
+        st.markdown('<div class="warn-box">⚪ No high-conviction setups right now. Monitoring continuously — alerts appear here the moment conditions trigger.</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(f"**{len(alerts)} alert(s) active** — sorted by urgency | Last scan: {ist_now().strftime('%I:%M:%S %p IST')}")
+        for a in alerts:
+            css   = "alert-high" if a["urgency"] == "HIGH" else "alert-med" if a["urgency"] == "MED" else "alert-low"
+            badge = "🔴 HIGH PRIORITY" if a["urgency"] == "HIGH" else "🟡 WATCH" if a["urgency"] == "MED" else "🟢 SETUP"
+            detail_safe = a["detail"].replace("<","&lt;").replace(">","&gt;")
+            action_safe = a["action"].replace("<","&lt;").replace(">","&gt;")
+            entry_safe  = a["entry"].replace("<","&lt;").replace(">","&gt;")
+            st.markdown(
+                f'''<div class="{css}">
+                  <div class="alert-title">{badge} &nbsp;|&nbsp; {a["stock"]} — {a["signal"]}</div>
+                  <div class="alert-sub">{detail_safe}</div>
+                  <div style="margin-top:6px;font-size:13px;font-weight:600;color:#e8eaf6">ACTION: {action_safe}</div>
+                  <div style="font-size:11px;color:#64b5f6;margin-top:3px">Entry: {entry_safe} | Scanned: {a["ts"]}</div>
+                </div>''',
+                unsafe_allow_html=True
+            )
+    st.caption("Alerts are algorithmic — NOT financial advice. Always set SL on every trade.")
+    st.divider()
 
     # Backtest
     st.markdown('<div class="section-hdr">🔬 Gap Prediction Backtest (~1 Year, upgraded signals)</div>', unsafe_allow_html=True)
